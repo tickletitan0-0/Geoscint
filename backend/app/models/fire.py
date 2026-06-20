@@ -1,18 +1,70 @@
 from sqlalchemy import Column
 from sqlalchemy import Integer
 from sqlalchemy import Float
-
+from sqlalchemy import String
+from sqlalchemy import DateTime
+from sqlalchemy.sql import func
+from sqlalchemy import UniqueConstraint
 from app.database import Base
 
 
 class Fire(Base):
+
     __tablename__ = "fires"
 
-    id = Column(Integer, primary_key=True, index=True)
+    __table_args__ = (
+        UniqueConstraint(
+            "latitude",
+            "longitude",
+            "acquisition_date",
+            "acquisition_time",
+            name="uq_fire_event"
+        ),
+    )
 
-    latitude = Column(Float)
-    longitude = Column(Float)
+    id = Column(
+        Integer,
+        primary_key=True,
+        index=True
+    )
 
-    confidence = Column(Integer)
+    latitude = Column(
+        Float,
+        nullable=False
+    )
 
-    brightness = Column(Float)
+    longitude = Column(
+        Float,
+        nullable=False
+    )
+
+    confidence = Column(
+        Integer,
+        nullable=False
+    )
+
+    brightness = Column(
+        Float,
+        nullable=False
+    )
+
+    satellite = Column(
+        String,
+        nullable=True
+    )
+
+    acquisition_date = Column(
+        String,
+        nullable=True
+    )
+
+    acquisition_time = Column(
+        String,
+        nullable=True
+    )
+
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False
+    )
