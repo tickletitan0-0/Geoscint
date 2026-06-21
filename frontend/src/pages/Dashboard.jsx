@@ -1,15 +1,18 @@
 import { useEffect, useState, useRef } from "react";
 import api from "../services/api";
-import FireMap from "../components/FireMap";
+import FireMap, { LocationSearch, distanceKm, SEARCH_RADIUS_KM } from "../components/FireMap";
 import TopFires from "../components/TopFires";
+import FireDetailPanel from "../components/FireDetailPanel";
 
 const CACHE_KEY = "terrapulse_cache";
 const CACHE_TTL = 65 * 60 * 1000;
+const REFRESH_CHECK_INTERVAL = 60 * 1000; // re-check every minute while the tab is open
 
-const saveCache = (stats, timestamp) => {
+const saveCache = (stats, fires, timestamp) => {
   try {
     localStorage.setItem(CACHE_KEY, JSON.stringify({
       stats,
+      fires,
       timestamp,
     }));
   } catch {
@@ -22,6 +25,7 @@ const loadCache = () => {
     const raw = localStorage.getItem(CACHE_KEY);
     if (!raw) return null;
     const cache = JSON.parse(raw);
+    if (!cache.stats || !cache.fires || !cache.timestamp) return null; // old/partial cache shape
     if (Date.now() - cache.timestamp > CACHE_TTL) return null;
     return cache;
   } catch {
@@ -97,50 +101,81 @@ function Dashboard() {
   const [error, setError]             = useState(false);
   const [progress, setProgress]       = useState(0);
   const [lastUpdated, setLastUpdated] = useState(null);
+  const [selectedFire, setSelectedFire] = useState(null);
+  const [searchedLocation, setSearchedLocation] = useState(null); // { lat, lon, label } | null
   const mapRef                        = useRef(null);
+  const lastUpdatedRef                = useRef(null); // mirrors lastUpdated for use inside intervals/listeners
+
+  // Fetches stats + fires together and treats them as one atomic snapshot —
+  // they always land in state (and in the cache) from the same moment in time.
+  const fetchFreshData = () => {
+    return Promise.all([
+      api.get("/fires/stats"),
+      api.get("/fires/map"),
+    ]).then(([statsRes, mapRes]) => {
+      const timestamp = Date.now();
+      setStats(statsRes.data);
+      setFires(mapRes.data);
+      setLastUpdated(new Date(timestamp));
+      lastUpdatedRef.current = timestamp;
+      saveCache(statsRes.data, mapRes.data, timestamp);
+    });
+  };
 
   useEffect(() => {
     const cache = loadCache();
-
     setProgress(10);
 
-    const statsPromise = cache
-      ? Promise.resolve({ data: cache.stats })
-      : api.get("/fires/stats");
+    if (cache) {
+      setStats(cache.stats);
+      setFires(cache.fires);
+      setLastUpdated(new Date(cache.timestamp));
+      lastUpdatedRef.current = cache.timestamp;
+      setProgress(100);
+      setTimeout(() => setMapReady(true), 300);
+      return;
+    }
 
-    statsPromise
-      .then((res) => {
-        setStats(res.data);
-        if (!cache) saveCache(res.data, Date.now());
-        setProgress(50);
-        return api.get("/fires/map");
-      })
-      .then((res) => {
-        setFires(res.data);
+    setProgress(30);
+    fetchFreshData()
+      .then(() => {
         setProgress(100);
-        setLastUpdated(cache ? new Date(cache.timestamp) : new Date());
         setTimeout(() => setMapReady(true), 300);
       })
       .catch(() => setError(true));
   }, []);
 
   useEffect(() => {
-    const refresh = () => {
-      api.get("/fires/stats").then((res) => {
-        setStats(res.data);
-        api.get("/fires/map").then((mapRes) => {
-          setFires(prev => {
-            if (prev?.length === mapRes.data.length) return prev;
-            saveCache(res.data, Date.now()); // ✅ fixed
-            return mapRes.data;
-          });
-          setLastUpdated(new Date());
+    const refreshIfStale = () => {
+      const last = lastUpdatedRef.current;
+      if (!last || Date.now() - last >= CACHE_TTL) {
+        fetchFreshData().catch(() => {
+          // Swallow background refresh errors — keep showing last-known-good data
+          // rather than bouncing the user to the error screen.
         });
-      });
+      }
     };
 
-    const interval = setInterval(refresh, CACHE_TTL);
-    return () => clearInterval(interval);
+    // Checking every minute (instead of relying on one setInterval timed at the
+    // full 65-minute TTL) means a throttled/backgrounded tab still catches up
+    // soon after it's checked, instead of missing its one shot entirely.
+    const interval = setInterval(refreshIfStale, REFRESH_CHECK_INTERVAL);
+
+    // Browsers pause/throttle timers in hidden tabs and during system sleep, so
+    // the interval above can't be relied on alone. Re-check the moment the tab
+    // becomes visible or regains focus again — this is what catches the "left
+    // it open for an hour, came back" case without needing a manual reload.
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") refreshIfStale();
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+    window.addEventListener("focus", refreshIfStale);
+
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener("visibilitychange", handleVisibility);
+      window.removeEventListener("focus", refreshIfStale);
+    };
   }, []);
 
   if (error) {
@@ -176,22 +211,24 @@ function Dashboard() {
         <div className="dashboard">
           <div className="hero animate delay-1" style={{ position: "relative", overflow: "hidden" }}>
             <EmberCanvas />
-            <h1>Terrapulse</h1>
-            <p>Global Wildfire Intelligence Platform</p>
+            <h1>Geoscint</h1>
+            <p>Planetary Intelligence Platform</p>
           </div>
+
+          <p className="hero-glow-subtitle">Active Fire Intelligence</p>
 
           <div className="stats-grid">
             <div className="stat-card animate delay-2">
               <h2>{stats.total_fires?.toLocaleString()}</h2>
-              <p>Total Fires</p>
+              <p>Active Detections</p>
             </div>
             <div className="stat-card animate delay-3">
               <h2>{stats.average_brightness?.toFixed(1)}</h2>
-              <p>Avg Brightness</p>
+              <p>Mean Thermal Intensity</p>
             </div>
             <div className="stat-card animate delay-4">
               <h2>{stats.high_confidence_fires?.toLocaleString()}</h2>
-              <p>High Risk Fires</p>
+              <p>Critical Detections</p>
             </div>
           </div>
 
@@ -206,18 +243,38 @@ function Dashboard() {
             </p>
           )}
 
+          <div className="dashboard-search animate delay-5">
+            <LocationSearch
+              activeLocation={searchedLocation}
+              onSelect={setSearchedLocation}
+              onClear={() => setSearchedLocation(null)}
+            />
+            {searchedLocation && (
+              <p className="dashboard-search-status">
+                {fires.filter(f => distanceKm(searchedLocation.lat, searchedLocation.lon, f.latitude, f.longitude) <= SEARCH_RADIUS_KM).length.toLocaleString()} of {fires.length.toLocaleString()} fires within {SEARCH_RADIUS_KM} km of {searchedLocation.label.split(",")[0]}
+              </p>
+            )}
+          </div>
+
           <hr className="divider" />
 
-          <div className="animate delay-5">
-            <FireMap fires={fires} mapRef={mapRef} />
+          <div className="map-section animate delay-5">
+            <FireMap
+              fires={fires}
+              mapRef={mapRef}
+              onSelectFire={setSelectedFire}
+              searchedLocation={searchedLocation}
+            />
           </div>
 
           <div className="animate delay-6">
-            <TopFires mapRef={mapRef} />
+            <TopFires mapRef={mapRef} onSelectFire={setSelectedFire} />
           </div>
 
         </div>
       </div>
+
+      <FireDetailPanel fire={selectedFire} onClose={() => setSelectedFire(null)} />
     </div>
   );
 }

@@ -1,23 +1,67 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import api from "../services/api";
 
-// FIRMS acq_time is UTC time as HHMM (leading zeros dropped), e.g. 412 -> 04:12, 1842 -> 18:42
-const formatAcqTime = (time) => {
-  if (time === undefined || time === null || time === "") return "—";
-  const str = String(time).padStart(4, "0");
-  return `${str.slice(0, 2)}:${str.slice(2)} UTC`;
-};
+import { formatAcqDateLocal, formatAcqTimeLocal } from "../utils/datetime";
+import { reverseGeocode } from "../utils/geocode";
+import { exportCSV, exportGeoJSON } from "../utils/export";
 
-function TopFires({ mapRef }) {
+function TopFires({ mapRef, onSelectFire }) {
 
   const [fires, setFires] = useState([]);
+  const [locations, setLocations] = useState({});
 
   useEffect(() => {
-    api.get("/fires/top")
-      .then((res) => setFires(res.data));
+    // BUGFIX: React StrictMode mounts effects twice in development, and any
+    // component remount would fire two concurrent requests. Without an ignore
+    // flag both .then() callbacks call setFires, causing the table to render
+    // duplicate rows. The cleanup sets ignored=true so only the response from
+    // the most-recent mount wins.
+    let ignored = false;
+    api.get("/fires/top").then((res) => {
+      if (!ignored) setFires(res.data);
+    });
+    return () => { ignored = true; };
   }, []);
 
+  useEffect(() => {
+    if (!fires.length) return;
+
+    let cancelled = false;
+    // Accumulate results in a ref so we can flush them all in one setState
+    // call once every geocode has resolved. Individual setLocations calls
+    // arriving during React's render cycle (one per ~1100ms gap) were causing
+    // React 18 concurrent-mode to discard in-progress row renders, making
+    // rows 3–7 appear to vanish intermittently.
+    const accumulated = {};
+
+    const validFires = fires
+      .map((fire, index) => ({ fire, index }))
+      .filter(({ fire }) =>
+        typeof fire.latitude === "number" && typeof fire.longitude === "number"
+      );
+
+    let settled = 0;
+
+    validFires.forEach(({ fire, index }) => {
+      reverseGeocode(fire.latitude, fire.longitude).then((label) => {
+        if (cancelled) return;
+        accumulated[index] = label;
+        settled++;
+        // Flush once all geocodes have resolved so the table re-renders once,
+        // not ten times in sequence.
+        if (settled === validFires.length) {
+          setLocations((prev) => ({ ...prev, ...accumulated }));
+        }
+      });
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [fires]);
+
   const handleRowClick = (fire) => {
+  onSelectFire?.(fire);
   if (mapRef?.current) {
     document.querySelector(".map-wrapper").scrollIntoView({ 
       behavior: "smooth", 
@@ -35,33 +79,22 @@ function TopFires({ mapRef }) {
   const handleExportCSV = () => {
     if (!fires.length) return;
 
-    const headers = ["Brightness", "Latitude", "Longitude", "Date", "Time (UTC)"];
-    const rows = fires.map((fire) => [
+    const headers = ["Brightness", "Location", "Latitude", "Longitude", "Date", "Time"];
+    const rows = fires.map((fire, index) => [
       fire.brightness,
+      locations[index] ?? "—",
       fire.latitude,
       fire.longitude,
-      fire.date,
-      formatAcqTime(fire.acquisition_time),
+      formatAcqDateLocal(fire.date, fire.acquisition_time),
+      formatAcqTimeLocal(fire.date, fire.acquisition_time),
     ]);
 
-    const escapeCell = (value) => {
-      const str = String(value ?? "");
-      return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
-    };
+    exportCSV(headers, rows, "top-fires");
+  };
 
-    const csvContent = [headers, ...rows]
-      .map((row) => row.map(escapeCell).join(","))
-      .join("\n");
-
-    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `top-fires-${new Date().toISOString().slice(0, 10)}.csv`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
+  const handleExportGeoJSON = () => {
+    if (!fires.length) return;
+    exportGeoJSON(fires, "top-fires");
   };
 
   return (
@@ -73,32 +106,61 @@ function TopFires({ mapRef }) {
           justifyContent: "space-between",
         }}
       >
-        <h2>Top 10 Hottest Fires</h2>
-        <button
-          onClick={handleExportCSV}
-          disabled={!fires.length}
-          style={{
-            padding: "5px 12px",
-            borderRadius: "8px",
-            border: "1px solid rgba(255,255,255,0.15)",
-            background: "rgba(15,23,42,0.85)",
-            color: fires.length ? "rgba(255,255,255,0.8)" : "rgba(255,255,255,0.3)",
-            fontSize: "0.75rem",
-            cursor: fires.length ? "pointer" : "not-allowed",
-            fontFamily: "JetBrains Mono, monospace",
-            backdropFilter: "blur(8px)",
-          }}
-        >
-          Export CSV
-        </button>
+        <h2>Hight-Intensity Detections</h2>
+        <div style={{ display: "flex", gap: "8px" }}>
+          <button
+            onClick={handleExportCSV}
+            disabled={!fires.length}
+            style={{
+              padding: "5px 12px",
+              borderRadius: "8px",
+              border: "1px solid rgba(255,255,255,0.1)",
+              background: "rgba(255,255,255,0.05)",
+              color: fires.length ? "rgba(255,255,255,0.7)" : "rgba(255,255,255,0.25)",
+              fontSize: "0.75rem",
+              cursor: fires.length ? "pointer" : "not-allowed",
+              fontFamily: "JetBrains Mono, monospace",
+              backdropFilter: "blur(16px)",
+              WebkitBackdropFilter: "blur(16px)",
+              transition: "background 0.2s ease, color 0.2s ease",
+            }}
+            onMouseEnter={e => { if (fires.length) e.currentTarget.style.background = "rgba(255,255,255,0.09)"; }}
+            onMouseLeave={e => { e.currentTarget.style.background = "rgba(255,255,255,0.05)"; }}
+          >
+            Download CSV
+          </button>
+          <button
+            onClick={handleExportGeoJSON}
+            disabled={!fires.length}
+            title="Export as GeoJSON for GIS tools (QGIS, ArcGIS, Google Earth)"
+            style={{
+              padding: "5px 12px",
+              borderRadius: "8px",
+              border: "1px solid rgba(255,255,255,0.1)",
+              background: "rgba(255,255,255,0.05)",
+              color: fires.length ? "rgba(255,255,255,0.7)" : "rgba(255,255,255,0.25)",
+              fontSize: "0.75rem",
+              cursor: fires.length ? "pointer" : "not-allowed",
+              fontFamily: "JetBrains Mono, monospace",
+              backdropFilter: "blur(16px)",
+              WebkitBackdropFilter: "blur(16px)",
+              transition: "background 0.2s ease, color 0.2s ease",
+            }}
+            onMouseEnter={e => { if (fires.length) e.currentTarget.style.background = "rgba(255,255,255,0.09)"; }}
+            onMouseLeave={e => { e.currentTarget.style.background = "rgba(255,255,255,0.05)"; }}
+          >
+            Download GeoJSON
+          </button>
+        </div>
       </div>
       <table>
         <thead>
           <tr>
-            <th>Brightness</th>
+            <th>Thermal Intensity (K)</th>
+            <th>Region</th>
             <th>Latitude</th>
             <th>Longitude</th>
-            <th>Date</th>
+            <th>Detected </th>
             <th>Time</th>
           </tr>
         </thead>
@@ -116,10 +178,13 @@ function TopFires({ mapRef }) {
                 style={{ cursor: "pointer" }}
               >
                 <td>{fire.brightness}</td>
+                <td className="location-cell">
+                  {locations[index] ?? <span className="location-loading">locating…</span>}
+                </td>
                 <td>{fire.latitude}</td>
                 <td>{fire.longitude}</td>
-                <td>{fire.date}</td>
-                <td>{formatAcqTime(fire.acquisition_time)}</td>
+                <td>{formatAcqDateLocal(fire.date, fire.acquisition_time)}</td>
+                <td>{formatAcqTimeLocal(fire.date, fire.acquisition_time)}</td>
               </tr>
             );
           })}

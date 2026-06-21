@@ -53,8 +53,10 @@ class FIRMSWorker:
         db = SessionLocal()
 
         try:
-            db.query(Fire).delete()
-            db.commit()
+            # Delete and insert in the SAME transaction (single commit at the end).
+            # Committing the delete separately would let concurrent requests see an
+            # empty table for the gap between the two commits.
+            db.query(Fire).delete(synchronize_session=False)
 
             fire_objects = [
                 Fire(
